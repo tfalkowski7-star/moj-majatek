@@ -352,7 +352,7 @@ function load(){
 function normalize(s){
   return {
     holdings: (s.holdings||[]).filter(h => h && TYPES[h.type]).map(h => ({id:h.id||uid(), ...h})),
-    prices: s.prices || {}, fx: s.fx || {}, gold: s.gold || null,
+    prices: s.prices || {}, fx: s.fx || {}, gold: s.gold || null, goldLive: s.goldLive || null,
     settings: s.settings || {}, history: Array.isArray(s.history) ? s.history : [],
     hide: !!s.hide,
   };
@@ -382,7 +382,8 @@ function valueOf(h){
   switch(h.type){
     case "gold": {
       const man = num(h.manualPrice);
-      if (state.gold && state.gold.plnPerGram) return {v: q * state.gold.plnPerGram * (h.unit==="g" ? 1 : OZ), src:"NBP"};
+      const gp = goldPrice();
+      if (gp) return {v: q * gp.plnPerGram * (h.unit==="g" ? 1 : OZ), src:gp.src};
       if (man != null) return {v: q * man, src:"ręcznie"};
       return {v:null};
     }
@@ -404,6 +405,14 @@ function valueOf(h){
   return {v:null};
 }
 
+// Cena złota: najpierw rynek na żywo (co minutę), gdy niedostępna, cena dzienna NBP
+function goldPrice(){
+  const L = state.goldLive;
+  if (L && L.plnPerGram && Date.now() - L.at < 24*3600*1000) return {plnPerGram:L.plnPerGram, src:"live", ch24:L.ch24};
+  const g = state.gold;
+  if (g && g.plnPerGram) return {plnPerGram:g.plnPerGram, src:"NBP", ch24: g.prevPlnPerGram ? (g.plnPerGram/g.prevPlnPerGram - 1)*100 : null};
+  return null;
+}
 // ---------- pobieranie cen ----------
 async function getJSON(url){ const r = await fetch(url,{cache:"no-store"}); if(!r.ok) throw new Error(r.status); return r.json(); }
 let busy = false, lastFull = 0;
@@ -425,10 +434,16 @@ async function refresh(mode){
     state.gold = {plnPerGram:last.cena, date:last.data, prevPlnPerGram: prev ? prev.cena : null, at:now};
   }).catch(() => errors.push("cena złota")));
   // krypto CoinGecko
+  const hasGold = state.holdings.some(h => h.type==="gold");
   const ids = [...new Set(state.holdings.filter(h => h.type==="crypto" && h.coinId).map(h => h.coinId))];
-  if (ids.length) jobs.push(getJSON("https://api.coingecko.com/api/v3/simple/price?vs_currencies=pln&include_24hr_change=true&ids="+encodeURIComponent(ids.join(","))).then(d => {
+  const cgIds = [...new Set([...ids, ...(hasGold ? ["pax-gold","tether"] : [])])];
+  let cg = null, spotUsd = null;
+  if (cgIds.length) jobs.push(getJSON("https://api.coingecko.com/api/v3/simple/price?vs_currencies=pln,usd&include_24hr_change=true&ids="+encodeURIComponent(cgIds.join(","))).then(d => {
+    cg = d;
     ids.forEach(id => { if (d[id] && d[id].pln != null) state.prices["cg:"+id] = {price:d[id].pln, ch24:d[id].pln_24h_change, at:now}; });
-  }).catch(() => errors.push("kryptowaluty")));
+  }).catch(() => { if (ids.length) errors.push("kryptowaluty"); }));
+  // złoto na żywo: cena spot za uncję w USD
+  if (hasGold) jobs.push(getJSON("https://api.gold-api.com/price/XAU").then(d => { if (d && d.price > 0) spotUsd = d.price; }).catch(() => {}));
   // akcje / ETF Twelve Data
   const key = state.settings.tdKey;
   const syms = [...new Set(state.holdings.filter(h => h.type==="stock" && h.symbol).map(h => h.symbol.toUpperCase()))];
@@ -446,6 +461,13 @@ async function refresh(mode){
     if (bad) errors.push(bad+" ticker(y) bez ceny");
   }).catch(() => errors.push("akcje/ETF")));
   await Promise.all(jobs);
+  if (hasGold) {
+    const usdpln = (cg && cg.tether && cg.tether.pln) || rate("USD");
+    const paxg = cg && cg["pax-gold"];
+    if (spotUsd && usdpln) state.goldLive = {plnPerGram: spotUsd*usdpln/OZ, usdOz: spotUsd, usdpln, ch24: paxg ? paxg.pln_24h_change : null, at: now};
+    else if (paxg && paxg.pln) state.goldLive = {plnPerGram: paxg.pln/OZ, usdOz: paxg.usd, usdpln: paxg.pln/paxg.usd, ch24: paxg.pln_24h_change, at: now};
+    else if (!state.gold) errors.push("cena złota");
+  }
   snapshot(); save(); render();
   $("#foot").dataset.err = errors.length ? "Nie udało się pobrać: "+errors.join(", ")+". Pokazuję ostatnie znane ceny." : "";
   renderFoot();
@@ -455,13 +477,13 @@ async function refresh(mode){
 setInterval(() => {
   if (document.visibilityState !== "visible") return;
   if (Date.now() - lastFull >= FULL_EVERY) refresh();
-  else if (state.holdings.some(h => h.type==="crypto")) refresh("crypto");
+  else if (state.holdings.some(h => h.type==="crypto" || h.type==="gold")) refresh("crypto");
 }, CRYPTO_EVERY);
 
 // Zmiana ceny aktywa w % od wczoraj (krypto: 24h, złoto: od poprzedniego notowania NBP, akcje: od ostatniej sesji)
 function change24(h, val){
   if (h.type==="crypto") { const p = state.prices["cg:"+h.coinId]; return p && p.ch24 != null ? p.ch24 : null; }
-  if (h.type==="gold" && val.src==="NBP") { const g = state.gold; return g && g.prevPlnPerGram ? (g.plnPerGram/g.prevPlnPerGram - 1)*100 : null; }
+  if (h.type==="gold" && (val.src==="NBP" || val.src==="live")) { const gp = goldPrice(); return gp && gp.ch24 != null ? gp.ch24 : null; }
   if (h.type==="stock" && val.src==="Twelve Data") { const p = state.prices["td:"+(h.symbol||"").toUpperCase()]; return p && p.ch24 != null ? p.ch24 : null; }
   return 0; // gotówka i wycena ręczna nie zmieniają się same
 }
@@ -545,7 +567,8 @@ function subline(h, val){
   switch(h.type){
     case "gold": {
       const g = h.unit==="g" ? q : q*OZ;
-      const per = state.gold && state.gold.plnPerGram ? (state.hide?"":` · ${fmtPLN.format(state.gold.plnPerGram*OZ)}/oz`) : (num(h.manualPrice)!=null ? " · cena ręczna" : "");
+      const gp = goldPrice();
+      const per = gp ? (state.hide?"":` · ${fmtPLN.format(gp.plnPerGram*OZ)}/oz`) : (num(h.manualPrice)!=null ? " · cena ręczna" : "");
       return `${fmtQty.format(q)} ${h.unit==="g"?"g":"oz"}${h.unit==="g"?"":` (${fmtQty.format(Math.round(g*10)/10)} g)`}${per}`;
     }
     case "crypto": { const p = state.prices["cg:"+h.coinId];
@@ -599,8 +622,10 @@ function renderFoot(){
   const err = $("#foot").dataset.err; if (err) parts.push(`<span class="down">${esc(err)}</span>`);
   const last = Math.max(0, ...Object.values(state.prices).map(p=>p.at||0), state.fx.at||0, (state.gold&&state.gold.at)||0);
   parts.push("Ceny odświeżone: "+ago(last||null));
-  if (state.holdings.some(h => h.type==="crypto")) parts.push(`<span class="live">Kursy krypto na żywo, co minutę</span>`);
-  if (state.gold) parts.push(`Złoto: NBP z ${state.gold.date}`);
+  if (state.holdings.some(h => h.type==="crypto" || h.type==="gold")) parts.push(`<span class="live">Kursy krypto i złota na żywo, co minutę</span>`);
+  const gp = goldPrice();
+  if (gp && gp.src==="live") parts.push(`Złoto na żywo: ${new Intl.NumberFormat("pl-PL",{style:"currency",currency:"USD"}).format(state.goldLive.usdOz)}/oz`);
+  else if (state.gold) parts.push(`Złoto: NBP z ${state.gold.date}`);
   if (state.fx.date) parts.push(`Kursy walut: NBP z ${state.fx.date}`);
   parts.push("Dane zapisane tylko na tym urządzeniu.");
   $("#foot").innerHTML = parts.join("<br>");
@@ -615,7 +640,7 @@ function setType(t){
   $("#qtyLabel").textContent = t==="cash" ? `Kwota (${$("#fCur").value})` : "Ilość";
   $("#fQty").placeholder = t==="cash" ? "np. 5000" : "0";
   $("#manualLabel").textContent = t==="gold" ? "Cena ręczna (PLN za jednostkę)" : (t==="other" ? "Ile to jest teraz warte" : "Cena ręczna za sztukę");
-  $("#manualHint").textContent = t==="gold" ? "Używana tylko, gdy nie uda się pobrać ceny z NBP."
+  $("#manualHint").textContent = t==="gold" ? "Używana tylko, gdy nie uda się pobrać ceny złota z internetu."
     : t==="stock" ? "W walucie wybranej wyżej."
     : t==="other" ? (OTHER_HINTS[$("#fName").value.trim()] || "Łączna wartość w wybranej walucie. Zaktualizuj ją, gdy się zmieni.") : "";
   $("#fManual").placeholder = t==="other" ? "np. 350" : "opcjonalnie";
