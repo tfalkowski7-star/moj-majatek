@@ -122,6 +122,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .item .val{font-weight:600;text-align:right}
 .item .sub{grid-column:2;color:var(--muted);font-size:.8rem;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item .pl,.item .warn,.item .plh{grid-column:3;font-size:.8rem;text-align:right}
+.item .extra{grid-column:2/4;font-size:.74rem;color:var(--muted);margin-top:2px}
 .item .chev{grid-column:4;grid-row:1/3;width:14px;height:14px;color:var(--muted);opacity:.5}
 .item:hover .chev{opacity:1}
 .up{color:var(--up)} .down{color:var(--down)}
@@ -276,6 +277,10 @@ textarea{min-height:110px;font-size:.8rem;font-family:ui-monospace,Consolas,mono
 
     <div class="field" data-for="gold crypto stock other"><label for="fCost">Ile za to zapłaciłeś łącznie (PLN)</label>
       <input id="fCost" inputmode="decimal" placeholder="opcjonalnie, do liczenia zysku" autocomplete="off"></div>
+
+    <div class="field" data-for="gold"><label for="fBuySpot">Cena złota w dniu zakupu (USD za uncję)</label>
+      <input id="fBuySpot" inputmode="decimal" placeholder="np. 3550" autocomplete="off">
+      <span class="hint">Opcjonalnie. Kurs z wykresu, np. TradingView. Wtedy zysk liczy się z samej zmiany ceny złota, bez marży sklepu.</span></div>
 
     <p class="msg" id="itemMsg"></p>
     <div class="actions">
@@ -487,17 +492,28 @@ function change24(h, val){
   if (h.type==="stock" && val.src==="Twelve Data") { const p = state.prices["td:"+(h.symbol||"").toUpperCase()]; return p && p.ch24 != null ? p.ch24 : null; }
   return 0; // gotówka i wycena ręczna nie zmieniają się same
 }
+// Zysk ze zmiany ceny złota od dnia zakupu, bez marży sklepu (gdy podano kurs złota w dniu zakupu)
+function goldMarketGain(h, val){
+  if (h.type!=="gold" || !(h.buySpotUsd > 0) || val.v == null || (val.src!=="live" && val.src!=="NBP")) return null;
+  const gp = goldPrice(), usdpln = (state.goldLive && state.goldLive.usdpln) || rate("USD");
+  if (!gp || !usdpln) return null;
+  const nowUsd = (state.goldLive && gp.src==="live") ? state.goldLive.usdOz : gp.plnPerGram*OZ/usdpln;
+  const pct = nowUsd / h.buySpotUsd - 1;
+  return {gain: val.v - val.v/(1+pct), base: val.v/(1+pct), pct};
+}
 function totals(){
-  let total = 0, cost = 0, costBase = 0, missing = 0, d24 = 0;
+  let total = 0, cost = 0, costBase = 0, missing = 0, d24 = 0, noPremium = false;
   const by = {};
   state.holdings.forEach(h => {
     const val = valueOf(h), v = val.v;
     if (v == null) { missing++; return; }
     total += v; by[h.type] = (by[h.type]||0) + v;
-    const c = num(h.cost); if (c != null) { cost += c; costBase += v; }
+    const mg = goldMarketGain(h, val);
+    if (mg) { cost += mg.base; costBase += v; noPremium = true; }
+    else { const c = num(h.cost); if (c != null) { cost += c; costBase += v; } }
     const p = change24(h, val); if (p) d24 += v - v/(1 + p/100);
   });
-  return {total, by, cost, costBase, missing, d24};
+  return {total, by, cost, costBase, missing, d24, noPremium};
 }
 function snapshot(){
   const t = totals(); if (!t.total) return;
@@ -527,7 +543,7 @@ function render(){
   };
   const stats = [];
   if (t.total) stats.push(stat("Zmiana od wczoraj", t.d24, t.total - t.d24, "wahania cen aktywów"));
-  if (t.cost > 0) stats.push(stat("Zysk od zakupu", t.costBase - t.cost, t.cost, "pozycje z ceną zakupu"));
+  if (t.cost > 0) stats.push(stat("Zysk od zakupu", t.costBase - t.cost, t.cost, t.noPremium ? "złoto liczone bez marży sklepu" : "pozycje z ceną zakupu"));
   else if (t.total) stats.push(`<div class="stat flat"><span class="k">Zysk od zakupu</span><span class="n">Wpisz w pozycji, ile za nią zapłaciłeś, a tu pokaże się Twój zysk.</span></div>`);
   $("#heroStats").innerHTML = stats.join("");
   $("#heroRow").innerHTML = t.missing ? `<span>${t.missing} poz. bez ceny</span>` : "";
@@ -603,12 +619,16 @@ function drawGroups(){
       const val = valueOf(h); if (val.v != null) sum += val.v;
       const c = num(h.cost);
       const pl = (c != null && val.v != null && c > 0) ? val.v - c : null;
-      const plHtml = pl == null ? "" : `<span class="pl num ${pl>=0?"up":"down"}">${state.hide?"":(pl>=0?"+":"−")+fmtPLN.format(Math.abs(pl))+" · "}${fmtPct.format(pl/c)}</span>`;
+      const plFmt = (d, base) => `${state.hide?"":(d>=0?"+":"−")+fmtPLN.format(Math.abs(d))+" · "}${fmtPct.format(d/base)}`;
+      const mg = goldMarketGain(h, val);
+      const plHtml = mg ? `<span class="pl num ${mg.gain>=0?"up":"down"}">${plFmt(mg.gain, mg.base)}</span>`
+        : pl == null ? "" : `<span class="pl num ${pl>=0?"up":"down"}">${plFmt(pl, c)}</span>`;
+      const extra = mg ? `<span class="extra num">Bez marży sklepu${pl != null ? ` · z marżą: <span class="${pl>=0?"up":"down"}">${plFmt(pl, c)}</span>` : ""}</span>` : "";
       const noPrice = val.v == null ? `<span class="warn">${type==="stock" ? "dodaj klucz lub cenę ręczną" : "brak ceny"}</span>` : "";
       return `<div class="itemrow"><button class="item" data-id="${h.id}" title="Edytuj">
         <span class="av" style="--c:var(${TYPES[type].color})" aria-hidden="true">${esc(avatar(h))}</span>
         <span class="name">${esc(h.name || TYPES[type].label)}</span><span class="val num">${money(val.v)}</span>
-        <span class="sub num">${subline(h,val)}</span>${plHtml || noPrice || '<span class="plh"></span>'}
+        <span class="sub num">${subline(h,val)}</span>${plHtml || noPrice || '<span class="plh"></span>'}${extra}
         <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
       </button></div>`;
     }).join("");
@@ -729,6 +749,7 @@ function openItem(h){
   $("#fTicker").value = h?.symbol && h.type==="stock" ? h.symbol : "";
   $("#fManual").value = h?.type==="other" && h.manualPrice != null ? Math.round((num(h.qty)||1) * h.manualPrice * 100)/100 : (h?.manualPrice ?? "");
   $("#fCost").value = h?.cost ?? "";
+  $("#fBuySpot").value = h?.buySpotUsd ?? "";
   selCoins = [];
   setType(h?.type || "gold");
   syncChips();
@@ -782,6 +803,8 @@ $("#formItem").addEventListener("submit", async e => {
   const h = editing ? {...editing} : {id:uid()};
   h.type = curType; h.qty = qty; h.name = $("#fName").value.trim();
   h.cost = num($("#fCost").value); h.manualPrice = num($("#fManual").value);
+  const bs = num($("#fBuySpot").value);
+  if (curType==="gold" && bs > 0) h.buySpotUsd = bs; else delete h.buySpotUsd;
   if (curType==="other" && (!editing || editing.manualPrice !== h.manualPrice || editing.qty !== 1)) h.updated = Date.now();
   delete h.unit; delete h.currency; delete h.symbol; delete h.coinId;
   if (curType==="gold") h.unit = $("#fUnit").value;
